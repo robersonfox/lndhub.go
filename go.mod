@@ -248,4 +248,4 @@ require (
 )
 
 // required to use lnrpc, see https://github.com/lightningnetwork/lnd/issues/8326#issuecomment-1873794540
-replace google.golang.org/protobuf => github.com/lightninglabs/protobuf-go-hex-display v1.30.0-hex-display
+replace google.golang.org/protobuf => github.com/lightninglabs/protobuf-go-hex-display v1.33.0-hex-display
