@@ -112,6 +112,10 @@ func (controller *PayInvoiceController) PayInvoice(c echo.Context) error {
 	}
 	sendPaymentResponse, err := controller.svc.PayInvoice(c.Request().Context(), invoice)
 	if err != nil {
+		if service.IsPaymentOutcomeUnknown(err) {
+			c.Logger().Errorf("Payment outcome unknown invoice_id:%v user_id:%v error: %v", invoice.ID, userID, err)
+			return c.JSON(responses.PaymentOutcomeUnknownError.HttpStatusCode, responses.PaymentOutcomeUnknownError)
+		}
 		c.Logger().Errorf("Payment failed invoice_id:%v user_id:%v error: %v", invoice.ID, userID, err)
 		if hub := sentryecho.GetHubFromContext(c); hub != nil {
 			hub.WithScope(func(scope *sentry.Scope) {

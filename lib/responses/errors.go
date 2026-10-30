@@ -22,6 +22,13 @@ var GeneralServerError = ErrorResponse{
 	HttpStatusCode: 500,
 }
 
+var PaymentOutcomeUnknownError = ErrorResponse{
+	Error:          true,
+	Code:           6,
+	Message:        "The payment outcome is not known yet. The payment is still being tracked, do not retry it",
+	HttpStatusCode: 500,
+}
+
 var BadArgumentsError = ErrorResponse{
 	Error:          true,
 	Code:           8,

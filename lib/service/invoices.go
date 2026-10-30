@@ -20,6 +20,8 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/schema"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type Route struct {
@@ -117,48 +119,137 @@ func (svc *LndhubService) SendInternalPayment(ctx context.Context, invoice *mode
 	return sendPaymentResponse, nil
 }
 
+// PaymentOutcomeUnknownError means the payment may already have been sent to the
+// network but its final state could not be read. The funds must stay reserved
+// until the payment tracker learns the real outcome.
+type PaymentOutcomeUnknownError struct {
+	Err error
+}
+
+func (e *PaymentOutcomeUnknownError) Error() string {
+	return fmt.Sprintf("payment outcome unknown: %v", e.Err)
+}
+
+func (e *PaymentOutcomeUnknownError) Unwrap() error {
+	return e.Err
+}
+
+func IsPaymentOutcomeUnknown(err error) bool {
+	var unknown *PaymentOutcomeUnknownError
+	return errors.As(err, &unknown)
+}
+
+func isFinalPaymentStatus(payment *lnrpc.Payment) bool {
+	return payment.GetStatus() == lnrpc.Payment_SUCCEEDED || payment.GetStatus() == lnrpc.Payment_FAILED
+}
+
 func (svc *LndhubService) SendPaymentSync(ctx context.Context, invoice *models.Invoice) (SendPaymentResponse, error) {
 	sendPaymentResponse := SendPaymentResponse{}
 
-	sendPaymentRequest, err := svc.createLnRpcSendRequest(invoice)
+	sendPaymentRequest, err := svc.createLnRpcSendRequest(ctx, invoice)
 	if err != nil {
 		return sendPaymentResponse, err
 	}
 
 	// Execute the payment
-	sendPaymentResultClient, err := svc.LndClient.SendPaymentSync(ctx, sendPaymentRequest)
-	if err != nil {
-		return sendPaymentResponse, err
-	}
-	sendPaymentResult, err := sendPaymentResultClient.Recv()
+	stream, err := svc.LndClient.SendPaymentSync(ctx, sendPaymentRequest)
 	if err != nil {
 		return sendPaymentResponse, err
 	}
 
-	// If there was a payment error we return an error
-	if sendPaymentResult.GetFailureReason() != lnrpc.PaymentFailureReason_FAILURE_REASON_NONE || sendPaymentResult.GetPaymentPreimage() == "" {
-		return sendPaymentResponse, errors.New(sendPaymentResult.GetFailureReason().String())
+	payment, err := svc.awaitFinalPayment(ctx, invoice, stream)
+	if err != nil {
+		return sendPaymentResponse, err
 	}
 
-	preimage := sendPaymentResult.GetPaymentPreimage()
-	sendPaymentResponse.PaymentPreimageStr = preimage
-	sendPaymentResponse.PaymentPreimage = []byte(preimage)
-	paymentHash := sendPaymentResult.GetPaymentHash()
-	sendPaymentResponse.PaymentHashStr = paymentHash
-	sendPaymentResponse.PaymentHash = []byte(paymentHash)
-	sendPaymentResponse.PaymentRoute = &Route{TotalAmt: sendPaymentResult.GetValueSat(), TotalFees: sendPaymentResult.GetFeeSat()}
+	if payment.GetStatus() == lnrpc.Payment_FAILED {
+		return sendPaymentResponse, errors.New(payment.GetFailureReason().String())
+	}
+
+	preimage, err := hex.DecodeString(payment.GetPaymentPreimage())
+	if err != nil || len(preimage) == 0 {
+		return sendPaymentResponse, &PaymentOutcomeUnknownError{Err: fmt.Errorf("succeeded payment has an invalid preimage")}
+	}
+	paymentHash, err := hex.DecodeString(payment.GetPaymentHash())
+	if err != nil {
+		return sendPaymentResponse, &PaymentOutcomeUnknownError{Err: fmt.Errorf("succeeded payment has an invalid hash")}
+	}
+
+	sendPaymentResponse.PaymentPreimage = preimage
+	sendPaymentResponse.PaymentPreimageStr = payment.GetPaymentPreimage()
+	sendPaymentResponse.PaymentHash = paymentHash
+	sendPaymentResponse.PaymentHashStr = payment.GetPaymentHash()
+	sendPaymentResponse.PaymentRoute = &Route{TotalAmt: payment.GetValueSat() + payment.GetFeeSat(), TotalFees: payment.GetFeeSat()}
 	return sendPaymentResponse, nil
 }
 
-func (svc *LndhubService) createLnRpcSendRequest(invoice *models.Invoice) (*routerrpc.SendPaymentRequest, error) {
+// awaitFinalPayment reads the payment stream until the payment succeeded or failed.
+// If the stream breaks, LND may still be sending the payment, so the outcome is
+// resolved by tracking the payment instead of assuming a failure.
+func (svc *LndhubService) awaitFinalPayment(ctx context.Context, invoice *models.Invoice, stream routerrpc.Router_SendPaymentV2Client) (*lnrpc.Payment, error) {
+	for {
+		payment, err := stream.Recv()
+		if err != nil {
+			return svc.resolvePaymentAfterStreamError(ctx, invoice, err)
+		}
+		if isFinalPaymentStatus(payment) {
+			return payment, nil
+		}
+	}
+}
+
+func (svc *LndhubService) resolvePaymentAfterStreamError(ctx context.Context, invoice *models.Invoice, streamErr error) (*lnrpc.Payment, error) {
+	// This attempt was rejected because the same payment already exists in LND.
+	// Tracking it would report the state of another attempt.
+	if status.Code(streamErr) == codes.AlreadyExists {
+		return nil, streamErr
+	}
+
+	rawHash, err := hex.DecodeString(invoice.RHash)
+	if err != nil {
+		return nil, &PaymentOutcomeUnknownError{Err: streamErr}
+	}
+	tracker, err := svc.LndClient.SubscribePayment(ctx, &routerrpc.TrackPaymentRequest{
+		PaymentHash:       rawHash,
+		NoInflightUpdates: true,
+	})
+	if err != nil || tracker == nil {
+		return nil, &PaymentOutcomeUnknownError{Err: streamErr}
+	}
+	for {
+		payment, err := tracker.Recv()
+		if err != nil {
+			// LND does not know this payment, so nothing was sent.
+			if status.Code(err) == codes.NotFound {
+				return nil, streamErr
+			}
+			return nil, &PaymentOutcomeUnknownError{Err: streamErr}
+		}
+		if isFinalPaymentStatus(payment) {
+			return payment, nil
+		}
+	}
+}
+
+func (svc *LndhubService) createLnRpcSendRequest(ctx context.Context, invoice *models.Invoice) (*routerrpc.SendPaymentRequest, error) {
 	//if we get here, the destination is never ourselves, so we can use a dummy
 	feeLimit := svc.CalcFeeLimit("dummy", invoice.Amount)
 
 	if !invoice.Keysend {
-		return &routerrpc.SendPaymentRequest{
-			PaymentRequest: invoice.PaymentRequest,
-			FeeLimitSat:    feeLimit,
-		}, nil
+		request := &routerrpc.SendPaymentRequest{
+			PaymentRequest:    invoice.PaymentRequest,
+			FeeLimitSat:       feeLimit,
+			NoInflightUpdates: true,
+		}
+		// LND only accepts an amount for invoices that do not carry one
+		decoded, err := svc.DecodePaymentRequest(ctx, invoice.PaymentRequest)
+		if err != nil {
+			return nil, err
+		}
+		if decoded.GetNumSatoshis() == 0 && decoded.GetNumMsat() == 0 {
+			request.Amt = invoice.Amount
+		}
+		return request, nil
 	}
 
 	// Prepare the LNRPC call
@@ -181,6 +272,7 @@ func (svc *LndhubService) createLnRpcSendRequest(invoice *models.Invoice) (*rout
 		Amt:               invoice.Amount,
 		PaymentHash:       paymentHash,
 		FeeLimitSat:       feeLimit,
+		NoInflightUpdates: true,
 		DestFeatures:      []lnrpc.FeatureBit{lnrpc.FeatureBit_TLV_ONION_REQ},
 		DestCustomRecords: invoice.DestinationCustomRecords,
 	}, nil
@@ -225,6 +317,13 @@ func (svc *LndhubService) PayInvoice(ctx context.Context, invoice *models.Invoic
 	} else {
 		paymentResponse, err = svc.SendPaymentSync(context.Background(), invoice)
 		if err != nil {
+			if IsPaymentOutcomeUnknown(err) {
+				// the payment may still complete: keep the funds reserved and let the tracker settle or revert it
+				svc.Logger.Errorf("Payment outcome unknown, tracking invoice_id:%v hash:%s error: %v", invoice.ID, invoice.RHash, err)
+				pending := *invoice
+				go svc.TrackOutgoingPaymentstatus(context.Background(), &pending)
+				return nil, err
+			}
 			svc.HandleFailedPayment(context.Background(), invoice, entry, err)
 			return nil, err
 		}

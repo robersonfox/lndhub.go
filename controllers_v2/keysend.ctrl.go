@@ -229,6 +229,10 @@ func (controller *KeySendController) SingleKeySend(ctx context.Context, reqBody 
 	}
 	sendPaymentResponse, err := controller.svc.PayInvoice(ctx, invoice)
 	if err != nil {
+		if service.IsPaymentOutcomeUnknown(err) {
+			controller.svc.Logger.Errorf("Payment outcome unknown invoice_id:%v user_id:%v error: %v", invoice.ID, userID, err)
+			return nil, &responses.PaymentOutcomeUnknownError
+		}
 		controller.svc.Logger.Errorj(
 			log.JSON{
 				"message": 	"payment failed",

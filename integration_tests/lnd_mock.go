@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"time"
@@ -75,30 +76,54 @@ func (mlnd *MockLND) ListChannels(ctx context.Context, req *lnrpc.ListChannelsRe
 type MockRouter_SendPaymentV2Client struct {
 	grpc.ClientStream
 	Value lnrpc.Payment
+	sent  bool
 }
 
+// Recv mimics LND: a single final update, then the end of the stream
 func (x *MockRouter_SendPaymentV2Client) Recv() (*lnrpc.Payment, error) {
+	if x.sent {
+		return nil, io.EOF
+	}
+	x.sent = true
 	return &x.Value, nil
 }
 
+// paymentTarget returns the payment hash and the amount in sats LND would use for the request
+func paymentTarget(req *routerrpc.SendPaymentRequest) (hash []byte, amtSat int64) {
+	if req.PaymentRequest == "" {
+		return req.PaymentHash, req.Amt
+	}
+	decoded, err := zpay32.Decode(req.PaymentRequest, &chaincfg.RegressionNetParams)
+	if err != nil {
+		return req.PaymentHash, req.Amt
+	}
+	amtSat = req.Amt
+	if decoded.MilliSat != nil {
+		amtSat = int64(decoded.MilliSat.ToSatoshis())
+	}
+	return decoded.PaymentHash[:], amtSat
+}
+
 func (mlnd *MockLND) SendPaymentSync(ctx context.Context, req *routerrpc.SendPaymentRequest, options ...grpc.CallOption) (routerrpc.Router_SendPaymentV2Client, error) {
+	hash, amtSat := paymentTarget(req)
 	return &MockRouter_SendPaymentV2Client{
 		Value: lnrpc.Payment{
+			Status:          lnrpc.Payment_SUCCEEDED,
 			FailureReason:   lnrpc.PaymentFailureReason_FAILURE_REASON_NONE,
-			PaymentPreimage: "preimage",
+			PaymentPreimage: hex.EncodeToString([]byte("preimage")),
 			Htlcs: []*lnrpc.HTLCAttempt{
 				{
 					Route: &lnrpc.Route{
 						TotalTimeLock: 0,
 						Hops:          []*lnrpc.Hop{},
 						TotalFeesMsat: 1000 * mlnd.fee,
-						TotalAmtMsat:  1000 * (req.Amt + mlnd.fee),
+						TotalAmtMsat:  1000 * (amtSat + mlnd.fee),
 					},
 				},
 			},
-			PaymentHash: hex.EncodeToString(req.PaymentHash),
-			ValueSat: req.Amt+mlnd.fee,
-			FeeSat: mlnd.fee,
+			PaymentHash: hex.EncodeToString(hash),
+			ValueSat:    amtSat,
+			FeeSat:      mlnd.fee,
 		}}, nil
 }
 
